@@ -5,3 +5,4 @@
 docs/
 /tdlib/
 vcpkg/
+vcpkg_installed/

@@ -46,7 +46,9 @@ public interface class ClientResultHandler {
 /// <summary>
 /// Main class for interaction with the TDLib.
 /// </summary>
-public ref class Client sealed {
+public
+ref class Client sealed : public System::IDisposable {
+
 public:
   /// <summary>
   /// Sends a request to the TDLib.
@@ -55,13 +57,19 @@ public:
   /// <param name="handler">Result handler with OnResult method which will be called with result
   /// of the query or with Telegram.Td.Api.Error as parameter. If it is null, nothing will be called.</param>
   /// <exception cref="NullReferenceException">Thrown when query is null.</exception>
-  void Send(Api::Function^ function, ClientResultHandler^ handler) {
-    std::uint64_t requestId = Increment(currentRequestId);
-    if (handler != nullptr) {
-      handlers[requestId] = handler;
+  void Send(Api::Function ^ function, ClientResultHandler ^ handler) {
+    if (function == nullptr) {
+      throw REF_NEW NullReferenceException("Function can't be null");
     }
-    auto request = td::td_api::move_object_as<td::td_api::Function>(ToUnmanaged(function)->get_object_ptr());
-    td::ClientManager::get_manager_singleton()->send(clientId, requestId, std::move(request));
+
+    std::uint64_t queryId = Increment(currentId);
+    if (handler != nullptr) {
+      handlers[queryId] = handler;
+    }
+    td::Client::Request request;
+    request.id = queryId;
+    request.function = td::td_api::move_object_as<td::td_api::Function>(ToUnmanaged(function)->get_object_ptr());
+    client->send(std::move(request));
   }
 
   /// <summary>
@@ -70,33 +78,33 @@ public:
   /// <param name="function">Object representing a query to the TDLib.</param>
   /// <returns>Returns request result.</returns>
   /// <exception cref="NullReferenceException">Thrown when query is null.</exception>
-  static Api::BaseObject^ Execute(Api::Function^ function) {
-    auto request = td::td_api::move_object_as<td::td_api::Function>(ToUnmanaged(function)->get_object_ptr());
-    return Api::FromUnmanaged(*td::ClientManager::execute(std::move(request)));
-  }
-
-  /// <summary>
-  /// Launches a cycle which will fetch all results of queries to TDLib and incoming updates from TDLib.
-  /// Must be called once on a separate dedicated thread on which all updates and query results from all Clients will be handled.
-  /// Never returns.
-  /// </summary>
-  static void Run() {
-    while (true) {
-      auto response = td::ClientManager::get_manager_singleton()->receive(300.0);
-      if (response.object != nullptr) {
-        bool isClosed = response.object->get_id() == td::td_api::updateAuthorizationState::ID &&
-            static_cast<td::td_api::updateAuthorizationState &>(*response.object).authorization_state_->get_id() ==
-            td::td_api::authorizationStateClosed::ID && response.request_id == 0;
-
-        ClientResultHandler^ handler;
-        if (response.request_id == 0 ? updateHandlers.TryGetValue(response.client_id, handler) :
-            handlers.TryRemove(response.request_id, handler)) {
-          // TODO try/catch
-          handler->OnResult(Api::FromUnmanaged(*response.object));
+  static Api::BaseObject ^
+      Execute(Api::Function ^ function) {
+        if (function == nullptr) {
+          throw REF_NEW NullReferenceException("Function can't be null");
         }
 
-        if (isClosed) {
-          updateHandlers.TryRemove(response.client_id, handler);
+        td::Client::Request request;
+        request.id = 0;
+        request.function = td::td_api::move_object_as<td::td_api::Function>(ToUnmanaged(function)->get_object_ptr());
+        return Api::FromUnmanaged(*td::Client::execute(std::move(request)).object);
+      }
+
+      /// <summary>
+      /// Launches a cycle which will fetch all results of queries to TDLib and incoming updates from TDLib.
+      /// Must be called once on a separate dedicated thread, on which all updates and query results will be handled.
+      /// Returns only when TDLib instance is closed.
+      /// </summary>
+  void Run() {
+    while (true) {
+      auto response = client->receive(10.0);
+      if (response.object != nullptr) {
+        ProcessResult(response.id, Api::FromUnmanaged(*response.object));
+
+        if (response.object->get_id() == td::td_api::updateAuthorizationState::ID &&
+            static_cast<td::td_api::updateAuthorizationState &>(*response.object).authorization_state_->get_id() ==
+                td::td_api::authorizationStateClosed::ID) {
+          break;
         }
       }
     }
@@ -107,69 +115,32 @@ public:
   /// </summary>
   /// <param name="updateHandler">Handler for incoming updates.</param>
   /// <returns>Returns created Client.</returns>
-  static Client^ Create(ClientResultHandler^ updateHandler) {
-    return REF_NEW Client(updateHandler);
-  }
+  static Client ^ Create(ClientResultHandler ^ updateHandler) { return REF_NEW Client(updateHandler); }
 
-#if !TD_CLI
-  /// <summary>
-  /// Sets the callback that will be called when a message is added to the internal TDLib log.
-  /// None of the TDLib methods can be called from the callback.
-  /// </summary>
-  /// <param name="max_verbosity_level">The maximum verbosity level of messages for which the callback will be called.</param>
-  /// <param name="callback">Callback that will be called when a message is added to the internal TDLib log.
-  /// Pass null to remove the callback.</param>
-  static void SetLogMessageCallback(std::int32_t max_verbosity_level, LogMessageCallback^ callback) {
-    std::lock_guard<std::mutex> lock(logMutex);
-    if (callback == nullptr) {
-      td::ClientManager::set_log_message_callback(max_verbosity_level, nullptr);
-      logMessageCallback = nullptr;
-    } else {
-      logMessageCallback = callback;
-      td::ClientManager::set_log_message_callback(max_verbosity_level, LogMessageCallbackWrapper);
-    }
+  virtual ~Client() {
+    delete client;
   }
-#endif
 
 private:
-  Client(ClientResultHandler^ updateHandler) {
-    clientId = td::ClientManager::get_manager_singleton()->create_client_id();
-    if (updateHandler != nullptr) {
-      updateHandlers[clientId] = updateHandler;
-    }
-    Send(REF_NEW Api::GetOption("version"), nullptr);
+
+  Client(ClientResultHandler ^ updateHandler) {
+    client = new td::Client();
+    handlers[0] = updateHandler;
   }
 
-#if !TD_CLI
-  static std::int64_t currentRequestId;
-#else
-  static std::int64_t currentRequestId = 0;
-#endif
-  static ConcurrentDictionary<std::uint64_t, ClientResultHandler^> handlers;
-  static ConcurrentDictionary<std::int32_t, ClientResultHandler^> updateHandlers;
-  std::int32_t clientId;
+  std::int64_t currentId = 0;
+  ConcurrentDictionary<std::uint64_t, ClientResultHandler ^> handlers;
+  td::Client *client = nullptr;
 
-#if !TD_CLI
-  static std::mutex logMutex;
-  static LogMessageCallback^ logMessageCallback;
-
-  static void LogMessageCallbackWrapper(int verbosity_level, const char *message) {
-    auto callback = logMessageCallback;
-    if (callback != nullptr) {
-      callback(verbosity_level, string_from_unmanaged(message));
+  void ProcessResult(std::uint64_t id, Api::BaseObject ^ object) {
+    ClientResultHandler ^ handler;
+    // update handler stays forever
+    if (id == 0 ? handlers.TryGetValue(id, handler) : handlers.TryRemove(id, handler)) {
+      // TODO try/catch
+      handler->OnResult(object);
     }
   }
-#endif
 };
-
-#if !TD_CLI
-std::int64_t Client::currentRequestId = 0;
-ConcurrentDictionary<std::uint64_t, ClientResultHandler^> Client::handlers;
-ConcurrentDictionary<std::int32_t, ClientResultHandler^> Client::updateHandlers;
-
-std::mutex Client::logMutex;
-LogMessageCallback^ Client::logMessageCallback;
-#endif
 
 }  // namespace Td
 }  // namespace Telegram
